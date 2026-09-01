@@ -11,6 +11,7 @@
 // @grant        GM_addStyle
 // @connect      store.steampowered.com
 // @connect      gamestatus.info
+// @connect      www.gamer520.com
 // ==/UserScript==
 
 (function () {
@@ -55,6 +56,11 @@
             color: var(--gpColor-Yellow, #FFC82C);
             border: 1px solid var(--gpColor-Yellow, #FFC82C);
             cursor: default;
+        }
+        .crack-status-gamer520 {
+            color: var(--gpColor-Blue, #67c1f5);
+            border: 1px solid var(--gpColor-Blue, #67c1f5);
+            cursor: pointer;
         }
     `);
 
@@ -152,6 +158,18 @@
     return el;
   };
 
+  const createGamer520Button = (gameName) => {
+    const btn = document.createElement("span");
+    btn.className = "crack-status-inline crack-status-gamer520";
+    btn.textContent = "在 gamer520 搜索";
+    btn.title = `跳转到 gamer520 搜索：${gameName}`;
+    btn.addEventListener("click", () => {
+      const url = `https://www.gamer520.com/?s=${encodeURIComponent(gameName)}`;
+      window.open(url, "_blank");
+    });
+    return btn;
+  };
+
   const main = async () => {
     const appId = getAppId();
     if (!appId) return;
@@ -175,6 +193,7 @@
       const { data, url } = await getCrackStatus(gameName);
       const statusEl = createInlineStatusElement(data, url);
       loading.replaceWith(statusEl);
+      titleEl.appendChild(createGamer520Button(gameName));
     } catch (e) {
       console.warn("[CrackStatus] 查询失败:", e);
       loading.replaceWith(createInlineStatusElement("unknown"));
