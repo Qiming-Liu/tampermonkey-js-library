@@ -1,13 +1,14 @@
 // ==UserScript==
-// @name         网盘二维码/链接提取码一键跳转 v4
+// @name         网盘二维码/链接提取码一键跳转 v5
 // @namespace    https://gamers520.com/
-// @version      0.4.0
-// @description  自动识别百度网盘/夸克网盘的二维码或文字链接，结合附近的提取码，使二维码可直接点击跳转（性能优化版）
-// @match        https://gamers520.com/*.html
-// @match        https://www.gamer520.com/*.html
+// @version      0.5.0
+// @description  自动识别百度/夸克/迅雷网盘的二维码或文字链接，结合附近的提取码，使二维码可直接点击跳转
+// @match        *://*.gamers520.com/*.html
+// @match        *://*.gamer520.com/*.html
 // @require      https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js
 // @grant        GM_xmlhttpRequest
 // @connect      *
+// @run-at       document-idle
 // ==/UserScript==
 
 (function () {
@@ -18,26 +19,34 @@
   const warn = (...a) => DEBUG && console.warn('[QR-Helper]', ...a);
 
   // ---------------- 网盘规则 ----------------
+  // 链接自身带的 pwd 优先于页面上找到的提取码
+  function buildWithPwd(url, code) {
+    const full = url.startsWith('http') ? url : 'https://' + url;
+    try {
+      const u = new URL(full);
+      if (u.searchParams.get('pwd')) return u.href;
+      if (code) u.searchParams.set('pwd', code);
+      return u.href;
+    } catch (e) {
+      return full;
+    }
+  }
+
   const NETDISK_RULES = [
     {
       type: 'baidu',
       label: '百度网盘',
-      urlRegex: /(https?:\/\/)?pan\.baidu\.com\/s\/[A-Za-z0-9_-]+/i,
-      buildFinalUrl(url, code) {
-        const full = url.startsWith('http') ? url : 'https://' + url;
-        const sep = full.includes('?') ? '&' : '?';
-        return code ? `${full}${sep}pwd=${code}` : full;
-      },
+      urlRegex: /(https?:\/\/)?pan\.baidu\.com\/s\/[A-Za-z0-9_-]+(\?[^\s"'<>]*)?/i,
     },
     {
       type: 'quark',
       label: '夸克网盘',
-      urlRegex: /(https?:\/\/)?pan\.quark\.cn\/s\/[A-Za-z0-9_-]+/i,
-      buildFinalUrl(url, code) {
-        const full = url.startsWith('http') ? url : 'https://' + url;
-        const sep = full.includes('?') ? '&' : '?';
-        return code ? `${full}${sep}pwd=${code}` : full;
-      },
+      urlRegex: /(https?:\/\/)?pan\.quark\.cn\/s\/[A-Za-z0-9_-]+(\?[^\s"'<>]*)?/i,
+    },
+    {
+      type: 'xunlei',
+      label: '迅雷云盘',
+      urlRegex: /(https?:\/\/)?pan\.xunlei\.com\/s\/[A-Za-z0-9_-]+(\?[^\s"'<>]*)?/i,
     },
   ];
 
@@ -50,15 +59,15 @@
     return null;
   }
 
-  // ---------------- 第0道关卡：整页关键词预检查，命中才继续 ----------------
-  const PAGE_GATE_REGEX = /网盘|夸克|迅雷|提取码|pan\.baidu\.com|pan\.quark\.cn/;
+  // ---------------- 第0道关卡：整页关键词预检查 ----------------
+  const PAGE_GATE_REGEX = /网盘|夸克|迅雷|提取码|pan\.baidu\.com|pan\.quark\.cn|pan\.xunlei\.com/;
 
-  // ---------------- 第1道关卡：确定正文范围，缩小扫描面积 ----------------
+  // ---------------- 第1道关卡：确定正文范围 ----------------
   const CONTENT_ROOT_SELECTORS = [
-    'article',
-    '.article-content',
     '.entry-content',
+    '.article-content',
     '.post-content',
+    'article',
     '.content-column',
     'main',
   ];
@@ -70,7 +79,7 @@
     return document.body;
   }
 
-  // ---------------- 区域排除（导航/菜单/侧边栏——精确词匹配，避免误伤 theiaStickySidebar 这类类名） ----------------
+  // ---------------- 区域排除（导航/菜单/侧边栏） ----------------
   const EXCLUDE_KEYWORDS = ['nav', 'navbar', 'menu', 'sidebar', 'widget'];
   function tokenMatchesExcluded(str) {
     if (!str) return false;
@@ -96,15 +105,14 @@
   }
 
   // ---------------- 提取码就近查找 ----------------
-  const CODE_REGEX = /(提取码|密码|访问码|口令)[\s:：]*([A-Za-z0-9]{3,8})\b/;
+  // 排除“解压密码”，它不是网盘提取码
+  const CODE_REGEX = /(?<!解压)(提取码|密码|访问码|口令)[\s:：]*([A-Za-z0-9]{3,8})(?![A-Za-z0-9])/;
 
   function getScopeTextExcludingOthers(scope, selfContainer, otherContainers) {
     const skipChildren = new Set();
     Array.from(scope.children || []).forEach((child) => {
       if (child === selfContainer) return;
-      const containsOther = otherContainers.some(
-        (el) => el !== selfContainer && child.contains(el)
-      );
+      const containsOther = otherContainers.some((el) => el !== selfContainer && child.contains(el));
       if (containsOther) skipChildren.add(child);
     });
     let text = '';
@@ -123,7 +131,6 @@
     let scope = anchorContainer;
     for (let level = 0; level < maxLevels && scope; level++) {
       const text = getScopeTextExcludingOthers(scope, anchorContainer, allContainers);
-      log(`向上第${level}层查找提取码`, text.trim().slice(0, 150));
       const m = text.match(CODE_REGEX);
       if (m) {
         log('✅ 找到提取码:', m[2]);
@@ -135,34 +142,38 @@
     return null;
   }
 
-  // ---------------- 快速路径：src参数直接编码链接 ----------------
+  // ---------------- 快速路径：图片 src 参数里直接编码了链接（如 api.qrserver.com） ----------------
   function extractFromImgSrc(src) {
+    let u;
     try {
-      const u = new URL(src, location.href);
-      for (const val of u.searchParams.values()) {
-        const decoded = decodeURIComponent(val);
-        const matched = matchNetdisk(decoded);
-        if (matched) return matched;
-      }
+      u = new URL(src, location.href);
     } catch (e) {
-      /* ignore */
+      return null;
+    }
+    for (const val of u.searchParams.values()) {
+      let decoded = val;
+      try {
+        decoded = decodeURIComponent(val);
+      } catch (e) {
+        /* 已经解码过 */
+      }
+      const matched = matchNetdisk(decoded);
+      if (matched) return matched;
     }
     return null;
   }
 
-  // ---------------- 判断图片是否"值得"花代价去解码 ----------------
+  // ---------------- 判断图片是否值得做像素解码 ----------------
   function isQRLikeImage(img) {
     const w = img.naturalWidth,
       h = img.naturalHeight;
     if (!w || !h) return false;
-    const sizeOk = w >= 50 && w <= 500 && h >= 50 && h <= 500;
+    const sizeOk = w >= 50 && w <= 600 && h >= 50 && h <= 600;
     const squareOk = Math.abs(w - h) <= Math.max(w, h) * 0.25;
     return sizeOk && squareOk;
   }
   function hasNearbyNetdiskHint(img) {
-    const alt = (img.alt || '').toLowerCase();
-    if (/二维码|扫码|qrcode|qr/.test(alt)) return true;
-    // 往上找3层，看卡片文字里有没有网盘相关关键词
+    if (/二维码|扫码|qrcode|qr/i.test(img.alt || '')) return true;
     let node = img.parentElement;
     for (let i = 0; i < 3 && node; i++) {
       if (PAGE_GATE_REGEX.test(node.textContent || '')) return true;
@@ -171,215 +182,220 @@
     return false;
   }
 
-  // ---------------- 像素级解码（仅在快速路径失败、且有上下文提示时才会被调用） ----------------
+  // ---------------- 像素级解码 ----------------
   function fetchImageBlobUrl(src) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'GET',
         url: src,
         responseType: 'blob',
-        onload: (resp) => (resp.response ? resolve(URL.createObjectURL(resp.response)) : reject(new Error('空响应'))),
-        onerror: (e) => reject(e),
+        onload: (resp) =>
+          resp.response ? resolve(URL.createObjectURL(resp.response)) : reject(new Error('空响应')),
+        onerror: reject,
+        ontimeout: reject,
+        timeout: 10000,
       });
     });
   }
-  function decodeQRFromImg(imgEl) {
+  function decodeFromUrl(imgSrc, crossOrigin) {
+    return new Promise((resolve) => {
+      const im = new Image();
+      if (crossOrigin) im.crossOrigin = 'anonymous';
+      im.onload = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = im.naturalWidth;
+          canvas.height = im.naturalHeight;
+          const ctx = canvas.getContext('2d', { willReadFrequently: true });
+          ctx.drawImage(im, 0, 0);
+          const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const code = jsQR(data.data, data.width, data.height);
+          resolve(code ? code.data : null);
+        } catch (err) {
+          warn('canvas解析异常:', err);
+          resolve(null);
+        }
+      };
+      im.onerror = () => resolve(null);
+      im.src = imgSrc;
+    });
+  }
+  async function decodeQRFromImg(imgEl) {
+    if (typeof jsQR !== 'function') return null;
     const src = imgEl.currentSrc || imgEl.src;
-    if (!src) return Promise.resolve(null);
-    function decodeFromUrl(imgSrc) {
-      return new Promise((resolve) => {
-        const im = new Image();
-        im.onload = () => {
-          try {
-            const canvas = document.createElement('canvas');
-            canvas.width = im.naturalWidth;
-            canvas.height = im.naturalHeight;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(im, 0, 0);
-            const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            const code = jsQR(data.data, data.width, data.height);
-            resolve(code ? code.data : null);
-          } catch (err) {
-            warn('canvas解析异常:', err);
-            resolve(null);
-          }
-        };
-        im.onerror = () => resolve(null);
-        im.src = imgSrc;
-      });
+    if (!src) return null;
+    try {
+      const blobUrl = await fetchImageBlobUrl(src);
+      try {
+        return await decodeFromUrl(blobUrl, false);
+      } finally {
+        URL.revokeObjectURL(blobUrl);
+      }
+    } catch (err) {
+      warn('GM_xmlhttpRequest失败，回退crossOrigin:', err);
+      return decodeFromUrl(src, true);
     }
-    return fetchImageBlobUrl(src)
-      .then((blobUrl) => decodeFromUrl(blobUrl).then((r) => (URL.revokeObjectURL(blobUrl), r)))
-      .catch((err) => {
-        warn('GM_xmlhttpRequest失败，回退crossOrigin:', err);
-        return new Promise((resolve) => {
-          const im = new Image();
-          im.crossOrigin = 'anonymous';
-          im.onload = () => {
-            try {
-              const canvas = document.createElement('canvas');
-              canvas.width = im.naturalWidth;
-              canvas.height = im.naturalHeight;
-              const ctx = canvas.getContext('2d');
-              ctx.drawImage(im, 0, 0);
-              const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
-              const code = jsQR(data.data, data.width, data.height);
-              resolve(code ? code.data : null);
-            } catch (err2) {
-              warn('回退方式也失败:', err2);
-              resolve(null);
-            }
-          };
-          im.onerror = () => resolve(null);
-          im.src = src;
-        });
-      });
   }
 
+  // ---------------- DOM 改造 ----------------
   function makeImageClickable(img, label, finalUrl) {
+    if (img.dataset.qrHelperUrl) return;
+    img.dataset.qrHelperUrl = finalUrl;
     img.style.cursor = 'pointer';
     img.style.outline = '2px solid #2d8cf0';
     img.style.outlineOffset = '2px';
-    img.title = `点击跳转 ${label}${finalUrl.includes('pwd=') ? '（已带提取码）' : ''}`;
-    img.addEventListener('click', () => window.open(finalUrl, '_blank'));
+    img.title = `点击跳转 ${label}${/[?&]pwd=/.test(finalUrl) ? '（已带提取码）' : ''}`;
+    img.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      window.open(img.dataset.qrHelperUrl, '_blank');
+    });
     log('图片已设为可点击:', label, finalUrl);
   }
 
   function wrapTextAsLink(textNode, matchedUrl, finalUrl, label) {
     const parent = textNode.parentNode;
-    if (!parent) return null;
+    if (!parent) return;
     const full = textNode.textContent;
     const idx = full.indexOf(matchedUrl);
-    if (idx === -1) return parent;
-    const before = full.slice(0, idx);
-    const after = full.slice(idx + matchedUrl.length);
+    if (idx === -1) return;
     const a = document.createElement('a');
     a.href = finalUrl;
     a.target = '_blank';
+    a.rel = 'noopener';
     a.textContent = matchedUrl;
     a.title = `点击跳转 ${label}`;
     const frag = document.createDocumentFragment();
-    if (before) frag.appendChild(document.createTextNode(before));
+    if (idx > 0) frag.appendChild(document.createTextNode(full.slice(0, idx)));
     frag.appendChild(a);
+    const after = full.slice(idx + matchedUrl.length);
     if (after) frag.appendChild(document.createTextNode(after));
     parent.replaceChild(frag, textNode);
-    return a;
   }
 
-  const processedImgs = new WeakSet();
-  const processedTextParents = new WeakSet();
-  const processedAnchors = new WeakSet();
-  const allCandidates = [];
+  // ---------------- 扫描 ----------------
+  const processed = new WeakSet();
+  const pendingImgs = new WeakSet();
 
-  function registerCandidate(sourceEl, rule, url, kind) {
+  function registerCandidate(list, sourceEl, matched, kind) {
     const startEl = kind === 'text' ? sourceEl.parentElement : sourceEl;
-    const container = startEl.closest('div,li,section,article,td') || startEl;
-    allCandidates.push({ container, rule, url, anchorEl: sourceEl, kind });
-    log(`登记候选 [${rule.label}]`, { url, kind });
+    const container = startEl.closest('div,li,section,article,td,p') || startEl;
+    list.push({ container, rule: matched.rule, url: matched.url, el: sourceEl, kind });
+    log(`登记候选 [${matched.rule.label}]`, matched.url, kind);
   }
 
-  async function processImages(root) {
-    const imgs = Array.from(root.querySelectorAll('img')).filter(
-      (img) => !processedImgs.has(img) && isQRLikeImage(img) && !isInExcludedRegion(img, root)
-    );
-    for (const img of imgs) {
-      processedImgs.add(img);
+  async function processImages(root, list) {
+    for (const img of root.querySelectorAll('img')) {
+      if (processed.has(img) || isInExcludedRegion(img, root)) continue;
       const src = img.currentSrc || img.src;
       if (!src) continue;
 
+      // 快速路径不依赖图片是否已加载
       let matched = extractFromImgSrc(src);
       if (!matched) {
-        // 只有图片本身/附近文字有网盘相关提示时，才值得花代价去真正解码像素
-        if (!hasNearbyNetdiskHint(img)) {
-          log('图片无网盘相关上下文提示，跳过解码以节省性能:', src.slice(0, 60));
+        if (!img.complete || !img.naturalWidth) {
+          // 懒加载/未加载完的图片：等加载后再扫一次
+          if (!pendingImgs.has(img)) {
+            pendingImgs.add(img);
+            img.addEventListener('load', scheduleScan, { once: true });
+          }
           continue;
         }
+        if (!isQRLikeImage(img) || !hasNearbyNetdiskHint(img)) {
+          processed.add(img);
+          continue;
+        }
+        processed.add(img);
         const decoded = await decodeQRFromImg(img);
-        if (!decoded) continue;
-        matched = matchNetdisk(decoded);
+        matched = decoded && matchNetdisk(decoded);
       }
-      if (!matched) continue;
-      registerCandidate(img, matched.rule, matched.url, 'img');
+      processed.add(img);
+      if (matched) registerCandidate(list, img, matched, 'img');
     }
   }
 
-  function processTextLinks(root) {
-    const candidates = [];
+  function processTextLinks(root, list) {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
-        if (!node.parentElement) return NodeFilter.FILTER_REJECT;
-        const tag = node.parentElement.tagName;
-        if (['SCRIPT', 'STYLE', 'NOSCRIPT'].includes(tag)) return NodeFilter.FILTER_REJECT;
-        if (isInExcludedRegion(node.parentElement, root)) return NodeFilter.FILTER_REJECT;
-        if (processedTextParents.has(node)) return NodeFilter.FILTER_REJECT;
+        const p = node.parentElement;
+        if (!p) return NodeFilter.FILTER_REJECT;
+        if (['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEXTAREA'].includes(p.tagName)) return NodeFilter.FILTER_REJECT;
+        // 已经在链接里的文字交给下面的 a[href] 处理，否则会重复包裹
+        if (p.closest('a')) return NodeFilter.FILTER_REJECT;
+        if (processed.has(node) || isInExcludedRegion(p, root)) return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_ACCEPT;
       },
     });
     let node;
     while ((node = walker.nextNode())) {
+      processed.add(node);
       const matched = matchNetdisk(node.textContent);
-      if (matched) candidates.push({ el: node, matched, kind: 'text' });
+      if (matched) registerCandidate(list, node, matched, 'text');
     }
     root.querySelectorAll('a[href]').forEach((a) => {
-      if (processedAnchors.has(a) || isInExcludedRegion(a, root)) return;
+      if (processed.has(a) || isInExcludedRegion(a, root)) return;
+      processed.add(a);
       const matched = matchNetdisk(a.getAttribute('href') || '');
-      if (matched) candidates.push({ el: a, matched, kind: 'anchor' });
-    });
-    candidates.forEach(({ el, matched, kind }) => {
-      if (kind === 'text') {
-        if (processedTextParents.has(el)) return;
-        processedTextParents.add(el);
-      } else {
-        if (processedAnchors.has(el)) return;
-        processedAnchors.add(el);
-      }
-      registerCandidate(el, matched.rule, matched.url, kind);
+      if (matched) registerCandidate(list, a, matched, 'anchor');
     });
   }
 
-  function finalizeCandidates() {
-    const containers = allCandidates.map((c) => c.container);
-    allCandidates.forEach((c) => {
+  function finalizeCandidates(list) {
+    const containers = list.map((c) => c.container);
+    for (const c of list) {
       const code = findExtractionCode(c.container, containers);
-      const finalUrl = c.rule.buildFinalUrl(c.url, code);
-      if (c.kind === 'img') makeImageClickable(c.anchorEl, c.rule.label, finalUrl);
+      const finalUrl = buildWithPwd(c.url, code);
+      if (c.kind === 'img') makeImageClickable(c.el, c.rule.label, finalUrl);
       else if (c.kind === 'anchor') {
-        c.anchorEl.href = finalUrl;
-        c.anchorEl.target = '_blank';
-      } else if (c.kind === 'text') wrapTextAsLink(c.anchorEl, c.url, finalUrl, c.rule.label);
-    });
-    allCandidates.length = 0;
+        c.el.href = finalUrl;
+        c.el.target = '_blank';
+      } else wrapTextAsLink(c.el, c.url, finalUrl, c.rule.label);
+    }
   }
 
-  let scanned = false;
+  let scanning = false;
+  let rescanRequested = false;
   async function scan() {
-    const root = getContentRoot();
-    // 第0道关卡：正文里完全没有网盘相关字样，直接跳过，不做任何图片/DOM遍历
-    if (!PAGE_GATE_REGEX.test(root.textContent || '')) {
-      log('未检测到网盘相关关键词，跳过扫描');
+    if (scanning) {
+      rescanRequested = true;
       return;
     }
-    log('====== 开始扫描 ======', root);
-    await processImages(root);
-    processTextLinks(root);
-    finalizeCandidates();
-    log('====== 扫描结束 ======');
+    scanning = true;
+    try {
+      const root = getContentRoot();
+      if (!PAGE_GATE_REGEX.test(root.textContent || '')) {
+        log('未检测到网盘相关关键词，跳过扫描');
+        return;
+      }
+      const list = [];
+      await processImages(root, list);
+      processTextLinks(root, list);
+      finalizeCandidates(list);
+    } catch (e) {
+      warn('扫描异常:', e);
+    } finally {
+      scanning = false;
+      if (rescanRequested) {
+        rescanRequested = false;
+        scheduleScan();
+      }
+    }
+  }
+
+  let debounceTimer = null;
+  function scheduleScan() {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(scan, 300);
   }
 
   function init() {
     scan();
-    const root = getContentRoot();
-    let debounceTimer = null;
-    const observer = new MutationObserver(() => {
-      clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(scan, 500);
-    });
-    observer.observe(root, { childList: true, subtree: true });
+    new MutationObserver(scheduleScan).observe(document.body, { childList: true, subtree: true });
   }
 
-  if (document.readyState === 'complete') {
-    init();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
   } else {
-    window.addEventListener('load', init);
+    init();
   }
 })();
